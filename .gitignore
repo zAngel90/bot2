@@ -2,10 +2,10 @@
 /node_modules
 
 # environment variables
-.env
+#.env
 
 # authentication files
-deviceAuth.json
+#deviceAuth.json
 
 # logs
 npm-debug.log*
