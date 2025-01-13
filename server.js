@@ -214,15 +214,25 @@ app.post('/bot2/api/friend-request', async (req, res) => {
         if (!username) {
             return res.status(400).json({
                 success: false,
-                error: 'Se requiere un nombre de usuario'
+                error: 'Se requiere un nombre de usuario',
+                details: null
             });
         }
 
         // Asegurarnos que el bot esté autenticado
         if (!botStatus.isAuthenticated || !botStatus.accessToken) {
+            console.error('❌ Error de autenticación:', {
+                isAuthenticated: botStatus.isAuthenticated,
+                hasAccessToken: !!botStatus.accessToken
+            });
             return res.status(401).json({
                 success: false,
-                error: 'Bot no autenticado'
+                error: 'Bot no autenticado',
+                details: {
+                    isAuthenticated: botStatus.isAuthenticated,
+                    hasAccessToken: !!botStatus.accessToken,
+                    botStatus: botStatus
+                }
             });
         }
 
@@ -235,14 +245,30 @@ app.post('/bot2/api/friend-request', async (req, res) => {
             console.error('❌ Error al enviar solicitud:', error);
             return res.status(500).json({
                 success: false,
-                error: error.message
+                error: error.message,
+                details: {
+                    stack: error.stack,
+                    response: error.response?.data,
+                    botStatus: {
+                        isAuthenticated: botStatus.isAuthenticated,
+                        hasAccessToken: !!botStatus.accessToken
+                    }
+                }
             });
         }
     } catch (error) {
         console.error('❌ Error al procesar solicitud:', error);
         res.status(500).json({ 
             success: false,
-            error: 'Error interno del servidor'
+            error: 'Error interno del servidor',
+            details: {
+                message: error.message,
+                stack: error.stack,
+                botStatus: {
+                    isAuthenticated: botStatus.isAuthenticated,
+                    hasAccessToken: !!botStatus.accessToken
+                }
+            }
         });
     }
 });
