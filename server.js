@@ -1134,7 +1134,8 @@ async function loadDeviceAuth() {
         botStatus = {
             accessToken: response.data.access_token,
             accountId: deviceAuth.accountId,
-            expiresAt: new Date(Date.now() + response.data.expires_in * 1000).toISOString()
+            expiresAt: new Date(Date.now() + response.data.expires_in * 1000).toISOString(),
+            isAuthenticated: true  // Añadiendo esta línea
         };
 
         console.log('✅ Bot autenticado exitosamente');
@@ -1177,7 +1178,8 @@ async function setupDeviceAuth() {
         botStatus = {
             accessToken: response.data.access_token,
             accountId: deviceAuth.accountId,
-            expiresAt: new Date(Date.now() + response.data.expires_in * 1000).toISOString()
+            expiresAt: new Date(Date.now() + response.data.expires_in * 1000).toISOString(),
+            isAuthenticated: true  // Añadiendo esta línea
         };
 
         console.log('✅ Bot autenticado exitosamente');
