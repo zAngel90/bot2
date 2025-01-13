@@ -23,7 +23,14 @@ const app = express();
 // Middleware global
 app.use(express.json());
 app.use(cors({
-  origin: ['https://lobomatshop.com', 'http://localhost:5173', 'localhost:5173'],
+  origin: [
+    'https://lobomatshop.com',
+    'https://www.lobomatshop.com',
+    'http://lobomatshop.com',
+    'http://www.lobomatshop.com',
+    'http://localhost:5173',
+    'localhost:5173'
+  ],
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
