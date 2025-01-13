@@ -12,6 +12,7 @@ const axios = require('axios'); // Importar axios
 const HttpsProxyAgent = require('https-proxy-agent');
 const jwt = require('jsonwebtoken'); // Importar jwt
 const path = require('path');
+const readline = require('readline');
 
 console.log('Variables de entorno cargadas:', {
   DLOCAL_API_KEY: process.env.DLOCAL_API_KEY ? 'Configurada' : 'No configurada',
@@ -52,13 +53,16 @@ app.use('/bot2', (req, res, next) => {
   next();
 });
 
-// Estado del bot
-let botStatus = {
-    deviceId: null,
-    accessToken: null,
-    accountId: null,
-    expiresAt: null,
-    isAuthenticated: false
+// Estado de los bots
+let botsStatus = {
+    bot1: {
+        deviceId: null,
+        accessToken: null,
+        isAuthenticated: false,
+        displayName: null,
+        accountId: null,
+        expiresAt: null
+    }
 };
 
 // Variables globales
@@ -69,12 +73,42 @@ function generateRequestId() {
     return Date.now().toString(36) + Math.random().toString(36).substr(2);
 }
 
+// Función para añadir un nuevo bot
+function addBot(botId) {
+    if (!botsStatus[botId]) {
+        botsStatus[botId] = {
+            deviceId: null,
+            accessToken: null,
+            isAuthenticated: false,
+            displayName: null,
+            accountId: null,
+            expiresAt: null
+        };
+    }
+    return botsStatus[botId];
+}
+
+// Configuración de headers comunes
+const FORTNITE_AUTH = {
+    ANDROID_CLIENT_ID: '3f69e56c7649492c8cc29f1af08a8a12',
+    ANDROID_SECRET: 'b51ee9cb12234f50a69efa67ef53812e',
+    BASIC_AUTH: 'Basic M2Y2OWU1NmM3NjQ5NDkyYzhjYzI5ZjFhZjA4YThhMTI6YjUxZWU5Y2IxMjIzNGY1MGE2OWVmYTY3ZWY1MzgxMmU=',
+    USER_AGENT: 'Fortnite/++Fortnite+Release-24.01-CL-27526713 Android/11'
+};
+
+const getCommonHeaders = (extraHeaders = {}) => ({
+    'Content-Type': 'application/x-www-form-urlencoded',
+    'Authorization': FORTNITE_AUTH.BASIC_AUTH,
+    'User-Agent': FORTNITE_AUTH.USER_AGENT,
+    ...extraHeaders
+});
+
 // Función para obtener token de acceso
-async function getAccessToken() {
+async function getAccessToken(botId) {
     try {
         // Si ya tenemos un token válido, lo devolvemos
-        if (botStatus.accessToken && botStatus.expiresAt > Date.now()) {
-            return botStatus.accessToken;
+        if (botsStatus[botId] && botsStatus[botId].accessToken && !isBotTokenExpired(botId)) {
+            return botsStatus[botId].accessToken;
         }
 
         console.log('🔑 Obteniendo nuevo token usando device auth...');
@@ -96,19 +130,16 @@ async function getAccessToken() {
                 secret: deviceAuthData.secret
             }),
             {
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'Authorization': 'Basic M2Y2OWU1NmM3NjQ5NDkyYzhjYzI5ZjFhZjA4YThhMTI6YjUxZWU5Y2IxMjIzNGY1MGE2OWVmYTY3ZWY1MzgxMmU=',
-                    'User-Agent': 'Fortnite/++Fortnite+Release-24.01-CL-27526713 Android/11'
-                }
+                headers: getCommonHeaders()
             }
         );
 
         if (response.data && response.data.access_token) {
             console.log('✅ Token obtenido exitosamente');
-            botStatus.accessToken = response.data.access_token;
-            botStatus.expiresAt = Date.now() + (response.data.expires_in * 1000);
-            botStatus.accountId = deviceAuthData.accountId;
+            updateBotStatus(botId, {
+                accessToken: response.data.access_token,
+                expiresAt: Date.now() + (response.data.expires_in * 1000)
+            });
             return response.data.access_token;
         } else {
             console.error('❌ Respuesta inválida al obtener token:', response.data);
@@ -121,7 +152,7 @@ async function getAccessToken() {
 }
 
 // Función para obtener información del usuario
-async function getUserInfo(accessToken) {
+async function getUserInfo(accessToken, botId) {
     try {
         const options = {
             hostname: 'account-public-service-prod.ol.epicgames.com',
@@ -177,18 +208,21 @@ async function getUserInfo(accessToken) {
 }
 
 // Función para validar el username antes de la solicitud de amistad
-async function validateFriendUsername(username) {
+async function validateFriendUsername(username, botId) {
     try {
         // Asegurarse de que el bot esté autenticado
-        await ensureBotAuthenticated();
+        await ensureBotAuthenticated(botId);
         
         // Obtener el ID de la cuenta del usuario
         console.log('🔍 Validando usuario:', username);
-        const userData = await getAccountIdByUsername(username);
-        if (!userData || !userData.id) {
+        const accountId = await getAccountIdByUsername(username, botId);
+        if (!accountId) {
             throw new Error('No se pudo encontrar el usuario');
         }
-        return userData;
+        return {
+            success: true,
+            accountId: accountId
+        };
     } catch (error) {
         console.error('❌ Error al validar usuario:', error);
         throw error;
@@ -198,22 +232,42 @@ async function validateFriendUsername(username) {
 // Endpoint para validar username
 app.post('/bot2/api/validate-friend', async (req, res) => {
     try {
-        const { username } = req.body;
+        const { username, botId } = req.body;
         
         if (!username) {
             throw new Error('Se requiere un nombre de usuario');
         }
 
-        const result = await validateFriendUsername(username);
-        res.json(result);
+        if (!botId) {
+            throw new Error('Se requiere el ID del bot');
+        }
 
+        const validationResult = await validateFriendUsername(username, botId);
+        
+        // Verificar si el usuario ya es amigo
+        const isFriend = await checkFriendship(botId, validationResult.accountId);
+        if (isFriend) {
+            return res.json({
+                success: false,
+                error: 'Este usuario ya es tu amigo'
+            });
+        }
+
+        res.json({
+            success: true,
+            accountId: validationResult.accountId,
+            message: 'Usuario validado correctamente'
+        });
     } catch (error) {
         console.error('❌ Error al validar usuario:', error);
-        res.status(500).json({ error: error.message });
+        res.status(500).json({ 
+            success: false,
+            error: error.message 
+        });
     }
 });
 
-// Endpoint para enviar solicitud de amistad
+// Endpoint para enviar solicitud de amistad desde todos los bots
 app.post('/bot2/api/friend-request', async (req, res) => {
     try {
         const { username } = req.body;
@@ -221,112 +275,158 @@ app.post('/bot2/api/friend-request', async (req, res) => {
         if (!username) {
             return res.status(400).json({
                 success: false,
-                error: 'Se requiere un nombre de usuario',
-                details: null
+                error: 'Se requiere username'
             });
         }
 
-        // Asegurarnos que el bot esté autenticado
-        if (!botStatus.isAuthenticated || !botStatus.accessToken) {
-            console.error('❌ Error de autenticación:', {
-                isAuthenticated: botStatus.isAuthenticated,
-                hasAccessToken: !!botStatus.accessToken
-            });
-            return res.status(401).json({
-                success: false,
-                error: 'Bot no autenticado',
-                details: {
-                    isAuthenticated: botStatus.isAuthenticated,
-                    hasAccessToken: !!botStatus.accessToken,
-                    botStatus: botStatus
+        console.log(`🔍 Enviando solicitudes de amistad a: ${username} desde todos los bots`);
+        
+        // Obtener el accountId del usuario una sola vez
+        const validationResult = await validateFriendUsername(username, 'bot1'); // Usamos bot1 para validar
+        if (!validationResult.success) {
+            return res.status(400).json(validationResult);
+        }
+
+        const friendAccountId = validationResult.accountId;
+        const results = [];
+        const errors = [];
+
+        // Enviar solicitud desde cada bot disponible
+        for (const botId of Object.keys(botsStatus)) {
+            try {
+                console.log(`🤖 Intentando enviar solicitud desde ${botId}...`);
+                const botData = await loadDeviceAuth(botId);
+                if (!botData || !botData.token) {
+                    throw new Error(`Bot ${botId} no autenticado`);
                 }
-            });
-        }
 
-        // Usar el token del bot directamente
-        try {
-            const userData = await validateFriendUsername(username);
-            const result = await sendFriendRequestToEpic(username, botStatus.accessToken);
-            return res.json(result);
-        } catch (error) {
-            console.error('❌ Error al enviar solicitud:', error);
-            return res.status(500).json({
-                success: false,
-                error: error.message,
-                details: {
-                    stack: error.stack,
-                    response: error.response?.data,
-                    botStatus: {
-                        isAuthenticated: botStatus.isAuthenticated,
-                        hasAccessToken: !!botStatus.accessToken
+                // Enviar la solicitud directamente
+                try {
+                    await sendFriendRequestToEpic(friendAccountId, botData.token, botId);
+                    results.push({
+                        botId,
+                        success: true,
+                        message: 'Solicitud enviada'
+                    });
+                } catch (sendError) {
+                    // Si el error es porque ya son amigos o ya hay solicitud, lo consideramos como éxito
+                    if (sendError.response?.data?.errorCode === 'errors.com.epicgames.friends.duplicate_friendship') {
+                        results.push({
+                            botId,
+                            success: true,
+                            message: 'Ya son amigos o ya hay solicitud pendiente'
+                        });
+                    } else {
+                        throw sendError;
                     }
                 }
-            });
-        }
-    } catch (error) {
-        console.error('❌ Error al procesar solicitud:', error);
-        res.status(500).json({ 
-            success: false,
-            error: 'Error interno del servidor',
-            details: {
-                message: error.message,
-                stack: error.stack,
-                botStatus: {
-                    isAuthenticated: botStatus.isAuthenticated,
-                    hasAccessToken: !!botStatus.accessToken
-                }
+            } catch (error) {
+                console.error(`❌ Error con ${botId}:`, error.message);
+                errors.push({
+                    botId,
+                    error: error.message
+                });
             }
+        }
+
+        res.json({
+            success: true,
+            message: 'Proceso de envío de solicitudes completado',
+            results,
+            errors: errors.length > 0 ? errors : undefined
+        });
+    } catch (error) {
+        console.error('❌ Error general:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
         });
     }
 });
 
-// Función para enviar solicitud de amistad
-async function sendFriendRequestToEpic(username, accessToken) {
+// Función para obtener token de acceso
+async function getAccessToken(botId) {
     try {
-        console.log('📨 Enviando solicitud de amistad a:', username);
+        // Si ya tenemos un token válido, lo devolvemos
+        if (botsStatus[botId] && botsStatus[botId].accessToken && !isBotTokenExpired(botId)) {
+            return botsStatus[botId].accessToken;
+        }
+
+        console.log('🔑 Obteniendo nuevo token usando device auth...');
         
-        // Validar el usuario y obtener su ID
-        const userData = await validateFriendUsername(username);
-        // Limpiar el ID de cualquier prefijo
-        const cleanId = userData.id.replace(/^(epic|psn|xbl|nintendo)_/, '');
-        
-        // Obtener el ID de la cuenta que envía la solicitud
-        const accountId = botStatus.accountId;
-        
-        console.log('🔄 Enviando solicitud desde:', accountId, 'para:', cleanId);
-        
-        const response = await axios({
-            method: 'POST',
-            url: `https://friends-public-service-prod.ol.epicgames.com/friends/api/v1/${accountId}/friends/${cleanId}`,
-            headers: {
-                'Authorization': `Bearer ${accessToken}`,
-                'Content-Type': 'application/json',
-                'User-Agent': 'Fortnite/++Fortnite+Release-24.01-CL-27526713 Android/11'
-            },
-            validateStatus: function (status) {
-                return status === 204 || status >= 200 && status < 300 || status === 409;
-            }
+        // Leer el device auth
+        const deviceAuthData = JSON.parse(await fsPromises.readFile('deviceAuth.json', 'utf8'));
+        console.log('📄 Device Auth cargado:', {
+            deviceId: deviceAuthData.deviceId,
+            accountId: deviceAuthData.accountId,
+            hasSecret: !!deviceAuthData.secret
         });
 
-        // Si la solicitud ya fue enviada, lo consideramos como éxito
-        if (response.status === 409 && response.data?.errorCode === 'errors.com.epicgames.friends.friend_request_already_sent') {
-            return { 
-                success: true, 
-                message: `Ya enviaste una solicitud de amistad a ${username}. Espera a que la acepte.`,
-                alreadySent: true
-            };
-        }
+        const response = await axios.post(
+            'https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token',
+            qs.stringify({
+                grant_type: 'device_auth',
+                device_id: deviceAuthData.deviceId,
+                account_id: deviceAuthData.accountId,
+                secret: deviceAuthData.secret
+            }),
+            {
+                headers: getCommonHeaders()
+            }
+        );
 
-        if (response.status === 204 || response.status === 200) {
-            return { 
-                success: true, 
-                message: `Solicitud de amistad enviada correctamente a ${username}` 
-            };
+        if (response.data && response.data.access_token) {
+            console.log('✅ Token obtenido exitosamente');
+            updateBotStatus(botId, {
+                accessToken: response.data.access_token,
+                expiresAt: Date.now() + (response.data.expires_in * 1000)
+            });
+            return response.data.access_token;
+        } else {
+            console.error('❌ Respuesta inválida al obtener token:', response.data);
+            throw new Error('Respuesta inválida al obtener token');
         }
-
-        throw new Error(response.data?.errorMessage || 'Error al enviar la solicitud');
     } catch (error) {
-        console.error('❌ Error al enviar solicitud:', error.response?.data || error.message);
+        console.error('❌ Error obteniendo token:', error.response?.data || error.message);
+        throw new Error(`No se pudo obtener el token de acceso. Status: ${error.response?.status}. Response: ${JSON.stringify(error.response?.data)}`);
+    }
+}
+
+// Función para enviar solicitud de amistad
+async function sendFriendRequestToEpic(friendAccountId, accessToken, botId) {
+    try {
+        // Obtener el accountId del bot que envía la solicitud
+        const botStatus = botsStatus[botId];
+        if (!botStatus || !botStatus.accountId) {
+            throw new Error('No se pudo obtener el accountId del bot');
+        }
+
+        console.log(`🤝 Bot ${botId} (${botStatus.accountId}) enviando solicitud a: ${friendAccountId}`);
+        
+        const response = await axios.post(
+            `https://friends-public-service-prod.ol.epicgames.com/friends/api/v1/${botStatus.accountId}/friends/${friendAccountId}`,
+            {},  // Cuerpo vacío
+            {
+                headers: getCommonHeaders({
+                    'Authorization': `Bearer ${accessToken}`
+                })
+            }
+        );
+
+        if (response.status === 204) {
+            console.log('✅ Solicitud de amistad enviada exitosamente');
+            return {
+                success: true,
+                message: 'Solicitud de amistad enviada correctamente'
+            };
+        } else {
+            throw new Error('Error al enviar la solicitud de amistad');
+        }
+    } catch (error) {
+        console.error('❌ Error al enviar solicitud de amistad:', error.message);
+        if (error.response) {
+            console.error('Detalles del error:', error.response.data);
+        }
         throw new Error(error.response?.data?.errorMessage || 'Error al enviar la solicitud de amistad');
     }
 }
@@ -334,7 +434,7 @@ async function sendFriendRequestToEpic(username, accessToken) {
 // Endpoint para recibir token de amigos
 app.post('/bot2/api/friend-token', async (req, res) => {
     try {
-        const { friendToken } = req.body;
+        const { friendToken, botId } = req.body;
         
         if (!friendToken) {
             return res.status(400).json({
@@ -343,14 +443,21 @@ app.post('/bot2/api/friend-token', async (req, res) => {
             });
         }
 
+        if (!botId) {
+            return res.status(400).json({
+                success: false,
+                message: 'Se requiere el ID del bot'
+            });
+        }
+
         try {
             // Si es un token hexadecimal, convertirlo a OAuth
             if (/^[0-9a-fA-F]{32}$/.test(friendToken)) {
                 const oauthToken = await exchangeHexTokenForOAuth(friendToken);
-                botStatus.friendToken = oauthToken.access_token;
+                botsStatus[botId].friendToken = oauthToken.access_token;
                 console.log('✅ Token OAuth guardado:', oauthToken.access_token.substring(0, 10) + '...');
             } else {
-                botStatus.friendToken = friendToken;
+                botsStatus[botId].friendToken = friendToken;
             }
 
             return res.json({
@@ -376,12 +483,17 @@ app.post('/bot2/api/friend-token', async (req, res) => {
 // Endpoint para obtener el estado del bot
 app.get('/bot2/api/bot-status', async (req, res) => {
     try {
+        const botId = req.query.botId;
+        if (!botId) {
+            throw new Error('Se requiere el ID del bot');
+        }
+
         const status = {
             isReady: true, // El bot está listo para recibir peticiones
-            isAuthenticated: botStatus.accessToken !== null,
-            displayName: botStatus.displayName || null,
+            isAuthenticated: botsStatus[botId] ? botsStatus[botId].isAuthenticated : false,
+            displayName: botsStatus[botId] ? botsStatus[botId].displayName : null,
             lastError: null,
-            hasFriendToken: botStatus.deviceId !== null
+            hasFriendToken: botsStatus[botId] ? botsStatus[botId].deviceId !== null : false
         };
         
         res.json(status);
@@ -398,88 +510,149 @@ app.get('/bot2/api/bot-status', async (req, res) => {
 });
 
 // Función para verificar si el token del bot ha expirado
-function isBotTokenExpired() {
-    if (!botStatus.expiresAt) return true;
-    return Date.now() >= botStatus.expiresAt;
+function isBotTokenExpired(botId) {
+    if (!botsStatus[botId] || !botsStatus[botId].expiresAt) return true;
+    return Date.now() >= new Date(botsStatus[botId].expiresAt).getTime();
 }
 
 // Función para refrescar el token del bot si es necesario
-async function ensureBotAuthenticated() {
-    if (!botStatus.isAuthenticated || isBotTokenExpired()) {
+async function ensureBotAuthenticated(botId) {
+    if (!botsStatus[botId] || !botsStatus[botId].isAuthenticated || isBotTokenExpired(botId)) {
         console.log('🔄 Token del bot expirado o no presente, reautenticando...');
-        botStatus.lastError = 'Token expirado o no presente';
-        botStatus.isAuthenticated = false;
+        botsStatus[botId].lastError = 'Token expirado o no presente';
+        botsStatus[botId].isAuthenticated = false;
         throw new Error('Bot necesita reautenticación');
     }
-    return botStatus.accessToken;
+    return botsStatus[botId].accessToken;
 }
 
 // Función para actualizar el estado del bot
-function updateBotStatus(newStatus) {
-    console.log('🔄 Actualizando estado del bot:', {
+function updateBotStatus(botId, newStatus) {
+    console.log(`🔄 Actualizando estado del bot ${botId}:`, {
         ...newStatus,
         accessToken: '***token***'
     });
     
-    botStatus = {
-        ...botStatus,
+    if (!botsStatus[botId]) {
+        addBot(botId);
+    }
+
+    botsStatus[botId] = {
+        ...botsStatus[botId],
         ...newStatus
     };
     
-    console.log('✅ Estado actualizado:', {
-        deviceId: botStatus.deviceId,
-        accountId: botStatus.accountId,
-        expiresAt: botStatus.expiresAt,
-        isAuthenticated: botStatus.isAuthenticated
+    console.log('✅ Estado actualizado para bot', botId, ':', {
+        deviceId: botsStatus[botId].deviceId,
+        accountId: botsStatus[botId].accountId,
+        expiresAt: botsStatus[botId].expiresAt,
+        isAuthenticated: botsStatus[botId].isAuthenticated
     });
 }
 
 // Función para resetear el estado del bot
-function resetBotStatus() {
-    console.log('🔄 Estado del bot reseteado');
-    updateBotStatus({
+function resetBotStatus(botId) {
+    console.log(`🔄 Reseteando estado del bot ${botId}`);
+    botsStatus[botId] = {
         deviceId: null,
         accessToken: null,
+        isAuthenticated: false,
+        displayName: null,
         accountId: null,
-        expiresAt: null,
-        isAuthenticated: false
-    });
+        expiresAt: null
+    };
 }
 
-// Función para verificar y formatear el token
-function formatAuthToken(token) {
-    if (!token) return null;
-    
-    // Nunca modificar el token, devolverlo tal cual
-    return token;
-}
-
-// Función para obtener accountId por displayName
-async function getAccountIdByUsername(username) {
+// Función para verificar si un usuario es amigo
+async function checkFriendship(botId, accountId) {
     try {
-        console.log("🔍 Buscando ID para usuario:", username);
-
-        if (!botStatus || !botStatus.accessToken) {
-            throw new Error('Bot no autenticado');
+        if (!accountId) {
+            throw new Error('Se requiere el ID de la cuenta');
         }
 
+        console.log(`🤝 Verificando amistad con: ${accountId}`);
+        
+        // Obtener el resumen completo de amigos
         const response = await axios.get(
-            `https://account-public-service-prod.ol.epicgames.com/account/api/public/account/displayName/${username}`,
+            `https://friends-public-service-prod.ol.epicgames.com/friends/api/v1/${botsStatus[botId].accountId}/summary`,
             {
                 headers: {
-                    'Authorization': `Bearer ${botStatus.accessToken}`,
-                    'Content-Type': 'application/json'
+                    'Authorization': `Bearer ${botsStatus[botId].accessToken}`
                 }
             }
         );
 
-        console.log("✅ Usuario encontrado:", response.data);
-        return response.data;
-    } catch (error) {
-        console.error("❌ Error en getAccountIdByUsername:", error.message);
-        if (error.response?.status === 404) {
-            return null;
+        const summary = response.data;
+        
+        // Verificar si es amigo
+        const friend = summary.friends.find(f => f.accountId === accountId);
+        if (friend) {
+            console.log("✅ Es amigo:", friend);
+            const created = new Date(friend.created);
+            const now = new Date();
+            const hoursDiff = Math.floor((now - created) / (1000 * 60 * 60));
+
+            return {
+                success: true,
+                accountId: accountId,
+                isFriend: true,
+                hasMinTime: hoursDiff >= 48,
+                timeRemaining: hoursDiff < 48 ? 48 - hoursDiff : 0,
+                created: created.toISOString(),
+                hoursAsFriends: hoursDiff
+            };
         }
+
+        // Verificar solicitudes entrantes
+        const pendingIncoming = summary.incoming.find(req => req.accountId === accountId);
+        if (pendingIncoming) {
+            console.log("⏳ Solicitud pendiente entrante:", pendingIncoming);
+            return {
+                success: false,
+                isFriend: false,
+                isPending: true,
+                error: 'Hay una solicitud de amistad pendiente por aceptar'
+            };
+        }
+
+        // Verificar solicitudes salientes
+        const pendingOutgoing = summary.outgoing.find(req => req.accountId === accountId);
+        if (pendingOutgoing) {
+            console.log("⏳ Solicitud pendiente saliente:", pendingOutgoing);
+            return {
+                success: false,
+                isFriend: false,
+                isPending: true,
+                error: 'Ya se envió una solicitud de amistad'
+            };
+        }
+
+        // Verificar si está bloqueado
+        const isBlocked = summary.blocklist?.find(b => b.accountId === accountId);
+        if (isBlocked) {
+            console.log("🚫 Usuario bloqueado");
+            return {
+                success: false,
+                isFriend: false,
+                isPending: false,
+                isBlocked: true,
+                error: 'El usuario está bloqueado'
+            };
+        }
+
+        // Si llegamos aquí, no son amigos y no hay solicitudes pendientes
+        console.log("❌ No son amigos y no hay solicitudes pendientes");
+        return {
+            success: false,
+            isFriend: false,
+            isPending: false,
+            hasMinTime: false,
+            timeRemaining: 48,
+            error: 'No son amigos y no hay solicitudes pendientes'
+        };
+
+    } catch (error) {
+        console.error("Error verificando amistad:", error.response?.data || error.message);
         throw error;
     }
 }
@@ -488,26 +661,32 @@ async function getAccountIdByUsername(username) {
 app.get('/bot2/api/check-friendship/:username', async (req, res) => {
     try {
         const { username } = req.params;
-        console.log('🔍 Verificando amistad con:', username);
-
-        // Usar la variable global botStatus directamente
-        if (!botStatus || !botStatus.accessToken) {
-            throw new Error('Bot no autenticado');
+        const botId = req.query.botId;
+        
+        if (!username) {
+            throw new Error('Se requiere el nombre de usuario');
         }
 
-        // Primero obtener el accountId del usuario
-        const userInfo = await getAccountIdByUsername(username);
-        if (!userInfo || !userInfo.id) {
-            return res.status(404).json({
-                success: false,
-                error: 'Usuario no encontrado'
-            });
+        if (!botId) {
+            throw new Error('Se requiere el ID del bot');
         }
 
-        const result = await checkFriendship(botStatus, userInfo.id);
-        res.json(result);
+        console.log("🔍 Buscando ID para usuario:", username);
+        
+        // Obtener el ID de la cuenta del usuario
+        const accountInfo = await getAccountIdByUsername(username, botId);
+        if (!accountInfo) {
+            throw new Error('Usuario no encontrado');
+        }
+
+        console.log("✅ Usuario encontrado:", accountInfo);
+
+        // Verificar la amistad usando el ID
+        const friendshipStatus = await checkFriendship(botId, accountInfo.id);
+        
+        res.json(friendshipStatus);
     } catch (error) {
-        console.error('Error verificando amistad:', error);
+        console.error("Error verificando amistad:", error);
         res.status(500).json({
             success: false,
             error: error.message
@@ -515,60 +694,30 @@ app.get('/bot2/api/check-friendship/:username', async (req, res) => {
     }
 });
 
-// Función para verificar si un usuario es amigo
-async function checkFriendship(botStatus, accountId) {
+// Función para obtener accountId por displayName
+async function getAccountIdByUsername(username, botId) {
     try {
-        if (!accountId) {
-            throw new Error('Se requiere el ID de la cuenta');
+        // Primero obtenemos el token de autenticación del bot
+        const botData = await loadDeviceAuth(botId);
+        if (!botData || !botData.token) {
+            throw new Error('Bot no autenticado');
         }
 
-        console.log(`🤝 Verificando amistad con: ${accountId}`);
-        
+        console.log("🔍 Buscando ID para usuario:", username);
+
         const response = await axios.get(
-            `https://friends-public-service-prod.ol.epicgames.com/friends/api/v1/${botStatus.accountId}/friends/${accountId}`,
+            `https://account-public-service-prod.ol.epicgames.com/account/api/public/account/displayName/${username}`,
             {
-                headers: {
-                    'Authorization': `Bearer ${botStatus.accessToken}`
-                }
+                headers: getCommonHeaders({
+                    'Authorization': `Bearer ${botData.token}`
+                })
             }
         );
 
-        // Si llegamos aquí, significa que son amigos (si no, habría lanzado 404)
-        const friendshipData = response.data;
-        console.log("✅ Estado de amistad:", friendshipData);
-
-        // Calcular el tiempo de amistad
-        const created = new Date(friendshipData.created);
-        const now = new Date();
-        const hoursDiff = Math.floor((now - created) / (1000 * 60 * 60));
-
-        console.log("⏰ Tiempo de amistad:", {
-            created: created.toISOString(),
-            now: now.toISOString(),
-            hours: hoursDiff,
-            days: Math.floor(hoursDiff / 24)
-        });
-
-        return {
-            success: true,
-            accountId: accountId,
-            isFriend: true,
-            hasMinTime: hoursDiff >= 48,
-            timeRemaining: hoursDiff < 48 ? 48 - hoursDiff : 0,
-            created: created.toISOString(),
-            hoursAsFriends: hoursDiff
-        };
+        console.log("✅ Usuario encontrado:", response.data);
+        return response.data.id;
     } catch (error) {
-        if (error.response?.status === 404) {
-            return {
-                success: false,
-                isFriend: false,
-                hasMinTime: false,
-                timeRemaining: 48,
-                error: 'Usuario no encontrado en la lista de amigos'
-            };
-        }
-        console.error("Error verificando amistad:", error);
+        console.error("❌ Error en getAccountIdByUsername:", error);
         throw error;
     }
 }
@@ -576,10 +725,15 @@ async function checkFriendship(botStatus, accountId) {
 // Endpoint para autenticación del bot
 app.post('/bot2/api/auth', async (req, res) => {
     try {
+        const botId = req.body.botId;
+        if (!botId) {
+            throw new Error('Se requiere el ID del bot');
+        }
+
         // Primero intentar usar Device Auth existente
         try {
             console.log('🔄 Intentando usar Device Auth existente...');
-            const deviceAuth = await setupDeviceAuth();
+            const deviceAuth = await loadDeviceAuth(botId);
             
             if (deviceAuth) {
                 console.log('🔑 Device Auth encontrado, intentando autenticar...');
@@ -587,16 +741,11 @@ app.post('/bot2/api/auth', async (req, res) => {
                 const response = await axios({
                     method: 'POST',
                     url: 'https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token',
-                    headers: {
-                        'Content-Type': 'application/x-www-form-urlencoded',
-                        'Authorization': 'Basic M2Y2OWU1NmM3NjQ5NDkyYzhjYzI5ZjFhZjA4YThhMTI6YjUxZWU5Y2IxMjIzNGY1MGE2OWVmYTY3ZWY1MzgxMmU=',
-                        'User-Agent': 'Fortnite/++Fortnite+Release-24.01-CL-27526713 Android/11'
-                    },
-                    ...defaultTlsOptions
+                    headers: getCommonHeaders()
                 });
 
                 if (response.data && response.data.access_token) {
-                    updateBotStatus({
+                    updateBotStatus(botId, {
                         deviceId: deviceAuth.deviceId,
                         accessToken: response.data.access_token,
                         accountId: deviceAuth.accountId,
@@ -621,24 +770,24 @@ app.post('/bot2/api/auth', async (req, res) => {
         console.log('✅ Token obtenido correctamente');
         
         // Actualizar tokens
-        updateBotStatus({
+        updateBotStatus(botId, {
             accessToken: tokenData.access_token,
             refreshToken: tokenData.refresh_token,
             expiresAt: Date.now() + (tokenData.expires_in * 1000)
         });
 
         // Obtener información del usuario
-        const userInfo = await getUserInfo(tokenData.access_token);
+        const userInfo = await getUserInfo(tokenData.access_token, botId);
         
         // Actualizar información del bot
-        updateBotStatus({
+        updateBotStatus(botId, {
             accountId: userInfo.account_id,
             isAuthenticated: true,
             lastError: null
         });
 
         // AHORA intentar crear Device Auth
-        await setupDeviceAuth();
+        await loadDeviceAuth(botId);
 
         res.json({
             success: true,
@@ -646,7 +795,7 @@ app.post('/bot2/api/auth', async (req, res) => {
         });
     } catch (error) {
         console.error('❌ Error al autenticar bot:', error.message);
-        updateBotStatus({
+        updateBotStatus(req.body.botId, {
             isAuthenticated: false,
             lastError: error.message
         });
@@ -657,7 +806,12 @@ app.post('/bot2/api/auth', async (req, res) => {
 // Endpoint para reiniciar el bot
 app.post('/bot2/api/reset', async (req, res) => {
     try {
-        resetBotStatus();
+        const botId = req.body.botId;
+        if (!botId) {
+            throw new Error('Se requiere el ID del bot');
+        }
+
+        resetBotStatus(botId);
         
         console.log('🔄 Bot reiniciado correctamente');
         res.json({ success: true });
@@ -677,12 +831,7 @@ async function exchangeHexTokenForOAuth(hexToken) {
             port: 443,
             path: '/account/api/oauth/token',
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Authorization': 'Basic M2Y2OWU1NmM3NjQ5NDkyYzhjYzI5ZjFhZjA4YThhMTI6YjUxZWU5Y2IxMjIzNGY1MGE2OWVmYTY3ZWY1MzgxMmU=',
-                'User-Agent': 'Fortnite/++Fortnite+Release-24.01-CL-27526713 Android/11'
-            },
-            ...defaultTlsOptions
+            headers: getCommonHeaders()
         };
 
         const body = qs.stringify({
@@ -714,17 +863,7 @@ async function exchangeHexTokenForOAuth(hexToken) {
                     }
                 });
             });
-
-            req.on('error', (error) => {
-                console.error('Error al obtener token:', error);
-                reject(error);
-            });
-
-            req.on('timeout', () => {
-                req.destroy();
-                reject(new Error('Timeout al obtener token'));
-            });
-
+            req.on('error', reject);
             req.write(body);
             req.end();
         });
@@ -757,7 +896,7 @@ async function getCurrentCatalog() {
             'https://fortnite-public-service-prod11.ol.epicgames.com/fortnite/api/storefront/v2/catalog',
             {
                 headers: {
-                    'Authorization': 'Bearer ' + await getAccessToken(),
+                    'Authorization': 'Bearer ' + await getAccessToken('bot1'),
                     'Content-Type': 'application/json',
                     'User-Agent': 'Fortnite/++Fortnite+Release-24.01-CL-27526713 Android/11'
                 }
@@ -784,16 +923,16 @@ function extractPriceFromDevName(devName) {
 }
 
 // Función para obtener el balance de V-Bucks
-async function getBalance() {
+async function getBalance(botId) {
     try {
-        await ensureBotAuthenticated();
+        await ensureBotAuthenticated(botId);
         
         const options = {
             hostname: 'fortnite-public-service-prod11.ol.epicgames.com',
-            path: `/fortnite/api/game/v2/profile/${botStatus.accountId}/client/QueryProfile?profileId=common_core&rvn=-1`,
+            path: `/fortnite/api/game/v2/profile/${botsStatus[botId].accountId}/client/QueryProfile?profileId=common_core&rvn=-1`,
             method: 'POST',
             headers: {
-                'Authorization': `Bearer ${botStatus.accessToken}`,
+                'Authorization': `Bearer ${botsStatus[botId].accessToken}`,
                 'Content-Type': 'application/json'
             },
             ...defaultTlsOptions
@@ -845,13 +984,13 @@ async function getBalance() {
 }
 
 // Función para obtener y validar el balance de V-Bucks
-async function getVBucksBalance() {
+async function getVBucksBalance(botId) {
     try {
-        if (!botStatus.isAuthenticated) {
+        if (!botsStatus[botId] || !botsStatus[botId].isAuthenticated) {
             throw new Error('Bot no autenticado');
         }
 
-        const balance = await getBalance();
+        const balance = await getBalance(botId);
         if (typeof balance !== 'number' || balance < 0) {
             throw new Error('Balance inválido recibido');
         }
@@ -867,19 +1006,26 @@ async function getVBucksBalance() {
 // Endpoint para enviar regalos
 app.post('/bot2/api/send-gift', async (req, res) => {
     try {
-        const { username, offerId, price, isBundle = false } = req.body;
+        const { username, offerId, price, isBundle = false, botId } = req.body;
 
         if (!username || !offerId) {
             return res.status(400).json({
                 success: false,
-                message: 'Se requiere username y offerId'
+                error: 'Se requiere username y offerId'
             });
         }
 
         if (!price || typeof price !== 'number' || price <= 0) {
             return res.status(400).json({
                 success: false,
-                message: 'Se requiere un precio válido'
+                error: 'Se requiere un precio válido'
+            });
+        }
+
+        if (!botId) {
+            return res.status(400).json({
+                success: false,
+                error: 'Se requiere el ID del bot'
             });
         }
 
@@ -891,11 +1037,11 @@ app.post('/bot2/api/send-gift', async (req, res) => {
         });
 
         // Obtener el accountId del usuario
-        const userInfo = await getAccountIdByUsername(username);
+        const userInfo = await getAccountIdByUsername(username, botId);
         if (!userInfo || !userInfo.id) {
             return res.status(404).json({
                 success: false,
-                message: 'Usuario no encontrado'
+                error: 'Usuario no encontrado'
             });
         }
 
@@ -911,12 +1057,12 @@ app.post('/bot2/api/send-gift', async (req, res) => {
         if (!catalogItem) {
             return res.status(404).json({
                 success: false,
-                message: 'Item no encontrado en el catálogo actual'
+                error: 'Item no encontrado en el catálogo actual'
             });
         }
 
         // Enviar el regalo
-        const giftResult = await sendGift(userInfo.id, offerId, price, isBundle);
+        const giftResult = await sendGift(userInfo.id, offerId, price, isBundle, botId);
         
         res.json({
             success: true,
@@ -931,7 +1077,7 @@ app.post('/bot2/api/send-gift', async (req, res) => {
             error.response?.data?.errorCode === 'errors.com.epicgames.modules.gameplayutils.not_enough_mtx') {
             return res.status(400).json({
                 success: false,
-                message: 'NOT_ENOUGH_VBUCKS',
+                error: 'NOT_ENOUGH_VBUCKS',
                 errorCode: 'not_enough_vbucks'
             });
         }
@@ -940,24 +1086,24 @@ app.post('/bot2/api/send-gift', async (req, res) => {
         if (error.response?.data?.errorMessage) {
             return res.status(400).json({
                 success: false,
-                message: error.response.data.errorMessage,
+                error: error.response.data.errorMessage,
                 errorCode: error.response.data.errorCode
             });
         }
 
         res.status(500).json({
             success: false,
-            message: error.message || 'Error al enviar regalo'
+            error: error.message || 'Error al enviar regalo'
         });
     }
 });
 
-async function sendGift(accountId, offerId, price, isBundle = false) {
+async function sendGift(accountId, offerId, price, isBundle = false, botId) {
     try {
         console.log('🎁 Intentando enviar regalo:', { accountId, offerId, price, isBundle });
 
         // Obtener el estado de amistad
-        const friendshipStatus = await checkFriendship(botStatus, accountId);
+        const friendshipStatus = await checkFriendship(botId, accountId);
         if (!friendshipStatus.success || !friendshipStatus.isFriend) {
             throw new Error('No eres amigo de este usuario');
         }
@@ -985,12 +1131,12 @@ async function sendGift(accountId, offerId, price, isBundle = false) {
 
         // Enviar el regalo
         const response = await axios.post(
-            'https://fortnite-public-service-prod11.ol.epicgames.com/fortnite/api/game/v2/profile/' + botStatus.accountId + '/client/GiftCatalogEntry?profileId=common_core',
+            'https://fortnite-public-service-prod11.ol.epicgames.com/fortnite/api/game/v2/profile/' + botsStatus[botId].accountId + '/client/GiftCatalogEntry?profileId=common_core',
             giftPayload,
             {
                 headers: {
                     'Content-Type': 'application/json',
-                    'Authorization': 'Bearer ' + await getAccessToken()
+                    'Authorization': 'Bearer ' + await getAccessToken(botId)
                 }
             }
         );
@@ -1020,7 +1166,7 @@ async function sendGift(accountId, offerId, price, isBundle = false) {
 }
 
 // Función para verificar si un usuario es amigo
-async function checkFriendship(botStatus, accountId) {
+async function checkFriendship(botId, accountId) {
     try {
         if (!accountId) {
             throw new Error('Se requiere el ID de la cuenta');
@@ -1029,10 +1175,10 @@ async function checkFriendship(botStatus, accountId) {
         console.log(`🤝 Verificando amistad con: ${accountId}`);
         
         const response = await axios.get(
-            `https://friends-public-service-prod.ol.epicgames.com/friends/api/v1/${botStatus.accountId}/friends/${accountId}`,
+            `https://friends-public-service-prod.ol.epicgames.com/friends/api/v1/${botsStatus[botId].accountId}/friends/${accountId}`,
             {
                 headers: {
-                    'Authorization': `Bearer ${botStatus.accessToken}`
+                    'Authorization': `Bearer ${botsStatus[botId].accessToken}`
                 }
             }
         );
@@ -1081,15 +1227,20 @@ async function checkFriendship(botStatus, accountId) {
 app.get('/bot2/api/check-friendship/:username', async (req, res) => {
     try {
         const { username } = req.params;
+        const botId = req.query.botId;
         
         if (!username) {
             throw new Error('Se requiere el nombre de usuario');
         }
 
+        if (!botId) {
+            throw new Error('Se requiere el ID del bot');
+        }
+
         console.log("🔍 Buscando ID para usuario:", username);
         
         // Obtener el ID de la cuenta del usuario
-        const accountInfo = await getAccountIdByUsername(username);
+        const accountInfo = await getAccountIdByUsername(username, botId);
         if (!accountInfo) {
             throw new Error('Usuario no encontrado');
         }
@@ -1097,7 +1248,7 @@ app.get('/bot2/api/check-friendship/:username', async (req, res) => {
         console.log("✅ Usuario encontrado:", accountInfo);
 
         // Verificar la amistad usando el ID
-        const friendshipStatus = await checkFriendship(botStatus, accountInfo.id);
+        const friendshipStatus = await checkFriendship(botId, accountInfo.id);
         
         res.json(friendshipStatus);
     } catch (error) {
@@ -1112,171 +1263,133 @@ app.get('/bot2/api/check-friendship/:username', async (req, res) => {
 // Agregar nueva función para manejar Device Auth
 const deviceAuthPath = path.join(__dirname, 'deviceAuth.json');
 
-async function loadDeviceAuth() {
+async function loadDeviceAuth(botId) {
     try {
-        console.log('🔄 Intentando cargar Device Auth existente...');
-        const deviceAuthData = await fsPromises.readFile(deviceAuthPath, 'utf8');
-        const deviceAuth = JSON.parse(deviceAuthData);
-        console.log('✅ Device Auth cargado correctamente');
-        console.log('🔑 Usando Device Auth para:', deviceAuth.accountId);
+        console.log(`🔄 Iniciando carga del bot ${botId}...`);
+        
+        const filePath = path.join(__dirname, `deviceAuth_${botId}.json`);
+        if (!fs.existsSync(filePath)) {
+            throw new Error(`No existe el archivo deviceAuth para el bot ${botId}`);
+        }
 
-        // Realizar autenticación inicial
-        const response = await axios.post('https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token',
+        const deviceAuthData = JSON.parse(await fs.promises.readFile(filePath, 'utf8'));
+        console.log(`📄 Archivo deviceAuth leído para ${botId}`);
+        
+        // Crear el form data correctamente
+        const formData = new URLSearchParams();
+        formData.append('grant_type', 'device_auth');
+        formData.append('account_id', deviceAuthData.accountId);
+        formData.append('device_id', deviceAuthData.deviceId);
+        formData.append('secret', deviceAuthData.secret);
+
+        console.log(`🔑 Obteniendo token para ${botId}...`);
+        // Obtener el token de acceso usando los datos de device auth
+        const tokenResponse = await axios.post(
+            'https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token',
+            formData.toString(),
             {
-                grant_type: 'device_auth',
-                account_id: deviceAuth.accountId,
-                device_id: deviceAuth.deviceId,
-                secret: deviceAuth.secret
-            },
-            {
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'Authorization': 'Basic M2Y2OWU1NmM3NjQ5NDkyYzhjYzI5ZjFhZjA4YThhMTI6YjUxZWU5Y2IxMjIzNGY1MGE2OWVmYTY3ZWY1MzgxMmU=',
-                    'User-Agent': 'Fortnite/++Fortnite+Release-24.01-CL-27526713 Android/11'
-                }
+                headers: getCommonHeaders()
             }
         );
 
         // Actualizar el estado del bot
-        botStatus = {
-            accessToken: response.data.access_token,
-            accountId: deviceAuth.accountId,
-            expiresAt: new Date(Date.now() + response.data.expires_in * 1000).toISOString(),
-            isAuthenticated: true  // Añadiendo esta línea
-        };
+        updateBotStatus(botId, {
+            accessToken: tokenResponse.data.access_token,
+            accountId: deviceAuthData.accountId,
+            displayName: tokenResponse.data.displayName,
+            isAuthenticated: true,
+            expiresAt: tokenResponse.data.expires_at
+        });
 
-        console.log('✅ Bot autenticado exitosamente');
-        return deviceAuth;
+        console.log(`✅ Bot ${botId} autenticado exitosamente`);
+
+        return {
+            ...deviceAuthData,
+            token: tokenResponse.data.access_token
+        };
     } catch (error) {
-        console.error('❌ Error al cargar Device Auth:', error);
+        console.error(`❌ Error al cargar ${botId}:`, error.message);
+        if (error.response) {
+            console.error('Detalles del error:', error.response.data);
+        }
         throw error;
     }
 }
 
-loadDeviceAuth();
-
-// Función para configurar el Device Auth
-async function setupDeviceAuth() {
+// Función para cargar todos los bots al inicio
+async function loadAllBots() {
     try {
-        console.log('🔄 Intentando cargar Device Auth existente...');
-        const deviceAuthData = await fsPromises.readFile(deviceAuthPath, 'utf8');
-        const deviceAuth = JSON.parse(deviceAuthData);
-        console.log('✅ Device Auth cargado correctamente');
-        console.log('🔑 Usando Device Auth para:', deviceAuth.accountId);
+        console.log('🔄 Cargando los bots disponibles...');
+        
+        // Leer el directorio para encontrar todos los archivos deviceAuth
+        const files = await fs.promises.readdir(__dirname);
+        const deviceAuthFiles = files.filter(file => file.startsWith('deviceAuth_'));
 
-        // Realizar autenticación inicial
-        const response = await axios.post('https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token',
-            {
-                grant_type: 'device_auth',
-                account_id: deviceAuth.accountId,
-                device_id: deviceAuth.deviceId,
-                secret: deviceAuth.secret
-            },
-            {
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'Authorization': 'Basic M2Y2OWU1NmM3NjQ5NDkyYzhjYzI5ZjFhZjA4YThhMTI6YjUxZWU5Y2IxMjIzNGY1MGE2OWVmYTY3ZWY1MzgxMmU=',
-                    'User-Agent': 'Fortnite/++Fortnite+Release-24.01-CL-27526713 Android/11'
-                }
+        if (deviceAuthFiles.length === 0) {
+            console.log('ℹ️ No se encontraron archivos deviceAuth');
+            return;
+        }
+
+        let botsLoaded = 0;
+        // Cargar cada bot que tenga archivo deviceAuth
+        for (const file of deviceAuthFiles) {
+            const botId = file.replace('deviceAuth_', '').replace('.json', '');
+            try {
+                await loadDeviceAuth(botId);
+                console.log(`✅ Bot ${botId} cargado correctamente`);
+                botsLoaded++;
+            } catch (error) {
+                console.error(`❌ Error al cargar ${botId}:`, error.message);
             }
-        );
+        }
 
-        // Actualizar el estado del bot
-        botStatus = {
-            accessToken: response.data.access_token,
-            accountId: deviceAuth.accountId,
-            expiresAt: new Date(Date.now() + response.data.expires_in * 1000).toISOString(),
-            isAuthenticated: true  // Añadiendo esta línea
-        };
+        console.log('✅ Carga de bots completada');
+        console.log(`🤖 Estado actual: ${botsLoaded} ${botsLoaded === 1 ? 'bot activo' : 'bots activos'}`);
+    } catch (error) {
+        console.error('❌ Error al cargar los bots:', error);
+    }
+}
 
-        console.log('✅ Bot autenticado exitosamente');
+// Iniciar el servidor y cargar los bots
+const PORT = process.env.PORT || 3003;
+const RESTART_INTERVAL = 60 * 60 * 1000; // 60 minutos en milisegundos
 
-        // Configurar reinicio programado
+async function startServer() {
+    try {
+        // Cargar variables de entorno
+        const envVars = {};
+        if (process.env.DLOCAL_API_KEY) envVars.DLOCAL_API_KEY = 'Configurada';
+        if (process.env.DLOCAL_SECRET_KEY) envVars.DLOCAL_SECRET_KEY = 'Configurada';
+        console.log('📝 Variables de entorno cargadas:', envVars);
+
+        // Iniciar el servidor
+        app.listen(PORT, () => {
+            console.log(`🚀 Bot 2 iniciado en puerto ${PORT}`);
+            console.log(`URL base: http://localhost:${PORT}/bot2`);
+        });
+    
+        console.log(`⏰ Configurando reinicio automático cada ${RESTART_INTERVAL / (60 * 1000)} minutos`);
+        
+        // Cargar todos los bots al inicio
+        await loadAllBots();
+        
+        // Configurar el reinicio automático
         setInterval(async () => {
             try {
-                console.log('🔄 Realizando reinicio programado...');
-                const deviceAuthData = await fsPromises.readFile(deviceAuthPath, 'utf8');
-                const deviceAuth = JSON.parse(deviceAuthData);
-                
-                const response = await axios.post('https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token',
-                    {
-                        grant_type: 'device_auth',
-                        account_id: deviceAuth.accountId,
-                        device_id: deviceAuth.deviceId,
-                        secret: deviceAuth.secret
-                    },
-                    {
-                        headers: {
-                            'Content-Type': 'application/x-www-form-urlencoded',
-                            'Authorization': 'Basic M2Y2OWU1NmM3NjQ5NDkyYzhjYzI5ZjFhZjA4YThhMTI6YjUxZWU5Y2IxMjIzNGY1MGE2OWVmYTY3ZWY1MzgxMmU=',
-                            'User-Agent': 'Fortnite/++Fortnite+Release-24.01-CL-27526713 Android/11'
-                        }
-                    }
-                );
-
-                botStatus = {
-                    accessToken: response.data.access_token,
-                    accountId: deviceAuth.accountId,
-                    expiresAt: new Date(Date.now() + response.data.expires_in * 1000).toISOString()
-                };
-
-                console.log('✅ Token actualizado correctamente');
+                console.log('🔄 Ejecutando reinicio programado...');
+                await loadAllBots();
             } catch (error) {
-                console.error('❌ Error al actualizar token:', error);
+                console.error('❌ Error durante el reinicio programado:', error);
             }
-        }, 3600000); // Cada hora
+        }, RESTART_INTERVAL);
 
-        return deviceAuth;
     } catch (error) {
-        console.error('❌ Error cargando Device Auth:', error);
-        throw error;
+        console.error('❌ Error al iniciar el servidor:', error);
+        process.exit(1);
     }
 }
 
-async function getAuth() {
-    try {
-        // Leer el device auth
-        const deviceAuthData = JSON.parse(await fsPromises.readFile(deviceAuthPath, 'utf8'));
-        
-        // Obtener token usando device auth
-        const response = await axios.post('https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token',
-            {
-                grant_type: 'device_auth',
-                account_id: deviceAuthData.accountId,
-                device_id: deviceAuthData.deviceId,
-                secret: deviceAuthData.secret
-            },
-            {
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'Authorization': 'Basic M2Y2OWU1NmM3NjQ5NDkyYzhjYzI5ZjFhZjA4YThhMTI6YjUxZWU5Y2IxMjIzNGY1MGE2OWVmYTY3ZWY1MzgxMmU=',
-                    'User-Agent': 'Fortnite/++Fortnite+Release-24.01-CL-27526713 Android/11'
-                }
-            }
-        );
-
-        return {
-            success: true,
-            access_token: response.data.access_token,
-            account_id: deviceAuthData.accountId,
-            expires_at: new Date(Date.now() + response.data.expires_in * 1000).toISOString()
-        };
-    } catch (error) {
-        console.error('Error obteniendo autenticación:', error);
-        return {
-            success: false,
-            error: error.message
-        };
-    }
-}
-
-// Iniciar el servidor y configurar Device Auth
-const port = process.env.PORT || 8080;
-app.listen(port, () => {
-    console.log(`\n🚀 Bot 2 iniciado en puerto ${port}`);
-    console.log(`URL base: ${process.env.NODE_ENV === 'production' ? 'https://lobomatshop.com/bot2' : `http://localhost:${port}/bot2`}`);
-    setupAutoRestart();
-});
+startServer();
 
 // Webhook para notificaciones de dLocal
 app.post('/bot2/api/payment-webhook', async (req, res) => {
@@ -1411,12 +1524,7 @@ async function authenticateBot(authorizationCode) {
         const response = await fetch(`https://${hostname}/account/api/oauth/token`, {
             method: 'POST',
             agent,
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Authorization': ANDROID_AUTH,
-                'User-Agent': ANDROID_USER_AGENT
-            },
-            body: body
+            headers: getCommonHeaders()
         });
 
         if (!response.ok) {
@@ -1444,35 +1552,40 @@ function setupAutoRestart() {
     
     console.log(`⏰ Configurando reinicio automático cada ${RESTART_INTERVAL / (60 * 1000)} minutos`);
     
+    // Cargar todos los bots al inicio
+    loadAllBots();
+    
+    // Configurar el reinicio automático
     setInterval(async () => {
-        console.log('🔄 Ejecutando reinicio programado...');
         try {
+            console.log('🔄 Ejecutando reinicio programado...');
             // Resetear el estado del bot
-            resetBotStatus();
+            resetBotStatus('bot1');
             
             // Intentar reautenticar
-            await setupDeviceAuth();
+            await loadDeviceAuth('bot1');
             
             console.log('✅ Reinicio programado completado');
         } catch (error) {
             console.error('❌ Error durante el reinicio programado:', error);
         }
     }, RESTART_INTERVAL);
+
 }
 
 // Función para obtener y validar el balance de V-Bucks
-async function getVBucksBalance() {
+async function getVBucksBalance(botId) {
     try {
-        if (!botStatus.isAuthenticated) {
+        if (!botsStatus[botId] || !botsStatus[botId].isAuthenticated) {
             throw new Error('Bot no autenticado');
         }
 
         // Verificar si el token ha expirado
-        if (isBotTokenExpired()) {
-            await ensureBotAuthenticated();
+        if (isBotTokenExpired(botId)) {
+            await ensureBotAuthenticated(botId);
         }
 
-        const balance = await getBalance();
+        const balance = await getBalance(botId);
         if (typeof balance !== 'number' || balance < 0) {
             throw new Error('Balance inválido recibido');
         }
@@ -1486,9 +1599,9 @@ async function getVBucksBalance() {
 }
 
 // Función para buscar amigos
-async function searchFriend(username) {
+async function searchFriend(username, botId) {
     try {
-        const accountInfo = await getAccountIdByUsername(username);
+        const accountInfo = await getAccountIdByUsername(username, botId);
         if (!accountInfo) {
             throw new Error('Usuario no encontrado');
         }
@@ -1497,16 +1610,16 @@ async function searchFriend(username) {
         console.log('Buscando amistad para:', {
             username,
             accountId,
-            botAccountId: botStatus.accountId
+            botAccountId: botsStatus[botId].accountId
         });
 
         // Intentar obtener la información específica de amistad
         try {
             const response = await axios.get(
-                `https://friends-public-service-prod.ol.epicgames.com/friends/api/v1/${botStatus.accountId}/friends/${accountId}`,
+                `https://friends-public-service-prod.ol.epicgames.com/friends/api/v1/${botsStatus[botId].accountId}/friends/${accountId}`,
                 {
                     headers: {
-                        'Authorization': `Bearer ${botStatus.accessToken}`
+                        'Authorization': `Bearer ${botsStatus[botId].accessToken}`
                     }
                 }
             );
@@ -1533,6 +1646,7 @@ async function searchFriend(username) {
                 friendshipHours: hoursDiff,
                 hasMinTime: hoursDiff >= 48
             };
+
         } catch (error) {
             // Si el error es 'friendship_not_found', significa que no son amigos
             if (error.response?.data?.errorCode === 'errors.com.epicgames.friends.friendship_not_found') {
@@ -1683,7 +1797,7 @@ function formatOfferId(offerId) {
     return offerId;
 }
 
-async function sendGift(accountId, offerId, price, isBundle = false) {
+async function sendGift(accountId, offerId, price, isBundle = false, botId) {
     try {
         console.log('🎁 Intentando enviar regalo:', {
             accountId,
@@ -1693,7 +1807,7 @@ async function sendGift(accountId, offerId, price, isBundle = false) {
         });
 
         // Obtener el estado de amistad
-        const friendshipStatus = await checkFriendship(botStatus, accountId);
+        const friendshipStatus = await checkFriendship(botId, accountId);
         
         if (!friendshipStatus.success || !friendshipStatus.isFriend) {
             throw new Error('No eres amigo de este usuario');
@@ -1723,12 +1837,12 @@ async function sendGift(accountId, offerId, price, isBundle = false) {
 
         // Enviar el regalo
         const response = await axios.post(
-            'https://fortnite-public-service-prod11.ol.epicgames.com/fortnite/api/game/v2/profile/' + botStatus.accountId + '/client/GiftCatalogEntry?profileId=common_core',
+            'https://fortnite-public-service-prod11.ol.epicgames.com/fortnite/api/game/v2/profile/' + botsStatus[botId].accountId + '/client/GiftCatalogEntry?profileId=common_core',
             giftPayload,
             {
                 headers: {
                     'Content-Type': 'application/json',
-                    'Authorization': 'Bearer ' + await getAccessToken()
+                    'Authorization': 'Bearer ' + await getAccessToken(botId)
                 }
             }
         );
@@ -1763,7 +1877,7 @@ async function sendGift(accountId, offerId, price, isBundle = false) {
 }
 
 // Función para verificar si un usuario es amigo
-async function checkFriendship(botStatus, accountId) {
+async function checkFriendship(botId, accountId) {
     try {
         if (!accountId) {
             throw new Error('Se requiere el ID de la cuenta');
@@ -1772,10 +1886,10 @@ async function checkFriendship(botStatus, accountId) {
         console.log(`🤝 Verificando amistad con: ${accountId}`);
         
         const response = await axios.get(
-            `https://friends-public-service-prod.ol.epicgames.com/friends/api/v1/${botStatus.accountId}/friends/${accountId}`,
+            `https://friends-public-service-prod.ol.epicgames.com/friends/api/v1/${botsStatus[botId].accountId}/friends/${accountId}`,
             {
                 headers: {
-                    'Authorization': `Bearer ${botStatus.accessToken}`
+                    'Authorization': `Bearer ${botsStatus[botId].accessToken}`
                 }
             }
         );
@@ -1824,15 +1938,20 @@ async function checkFriendship(botStatus, accountId) {
 app.get('/bot2/api/check-friendship/:username', async (req, res) => {
     try {
         const { username } = req.params;
+        const botId = req.query.botId;
         
         if (!username) {
             throw new Error('Se requiere el nombre de usuario');
         }
 
+        if (!botId) {
+            throw new Error('Se requiere el ID del bot');
+        }
+
         console.log("🔍 Buscando ID para usuario:", username);
         
         // Obtener el ID de la cuenta del usuario
-        const accountInfo = await getAccountIdByUsername(username);
+        const accountInfo = await getAccountIdByUsername(username, botId);
         if (!accountInfo) {
             throw new Error('Usuario no encontrado');
         }
@@ -1840,7 +1959,7 @@ app.get('/bot2/api/check-friendship/:username', async (req, res) => {
         console.log("✅ Usuario encontrado:", accountInfo);
 
         // Verificar la amistad usando el ID
-        const friendshipStatus = await checkFriendship(botStatus, accountInfo.id);
+        const friendshipStatus = await checkFriendship(botId, accountInfo.id);
         
         res.json(friendshipStatus);
     } catch (error) {
@@ -1856,7 +1975,7 @@ app.get('/bot2/api/check-friendship/:username', async (req, res) => {
 async function getAuth() {
     try {
         // Leer el device auth
-        const deviceAuthData = JSON.parse(await fsPromises.readFile(deviceAuthPath, 'utf8'));
+        const deviceAuthData = JSON.parse(await fs.promises.readFile(deviceAuthPath, 'utf8'));
         
         // Obtener token usando device auth
         const response = await axios.post('https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token',
@@ -1867,11 +1986,7 @@ async function getAuth() {
                 secret: deviceAuthData.secret
             },
             {
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'Authorization': 'Basic M2Y2OWU1NmM3NjQ5NDkyYzhjYzI5ZjFhZjA4YThhMTI6YjUxZWU5Y2IxMjIzNGY1MGE2OWVmYTY3ZWY1MzgxMmU=',
-                    'User-Agent': 'Fortnite/++Fortnite+Release-24.01-CL-27526713 Android/11'
-                }
+                headers: getCommonHeaders()
             }
         );
 
@@ -1889,3 +2004,56 @@ async function getAuth() {
         };
     }
 }
+
+// Endpoint para autenticación por consola
+app.post('/bot2/api/console-auth', async (req, res) => {
+    try {
+        const { authorizationCode, botId } = req.body;
+        
+        if (!authorizationCode || !botId) {
+            throw new Error('Se requiere código de autorización y ID del bot');
+        }
+
+        console.log(`🔐 Iniciando autenticación por consola para bot ${botId}`);
+
+        // Intercambiar el código por un token OAuth
+        const tokenData = await exchangeHexTokenForOAuth(authorizationCode);
+        
+        if (!tokenData || !tokenData.access_token) {
+            throw new Error('Error al obtener token OAuth');
+        }
+
+        // Obtener información del usuario
+        const userInfo = await getUserInfo(tokenData.access_token, botId);
+        
+        // Configurar Device Auth
+        const deviceAuth = await loadDeviceAuth(botId);
+        
+        // Guardar Device Auth en un archivo específico para este bot
+        const deviceAuthPath = path.join(__dirname, `deviceAuth_${botId}.json`);
+        await fs.promises.writeFile(deviceAuthPath, JSON.stringify(deviceAuth, null, 4));
+
+        // Actualizar estado del bot
+        updateBotStatus(botId, {
+            deviceId: deviceAuth.deviceId,
+            accessToken: tokenData.access_token,
+            accountId: userInfo.account_id,
+            displayName: userInfo.displayName,
+            isAuthenticated: true,
+            expiresAt: new Date(Date.now() + tokenData.expires_in * 1000).toISOString()
+        });
+
+        res.json({
+            success: true,
+            message: `Bot ${botId} autenticado correctamente`,
+            displayName: userInfo.displayName
+        });
+
+    } catch (error) {
+        console.error('❌ Error en autenticación por consola:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
