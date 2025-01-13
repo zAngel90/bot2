@@ -343,21 +343,23 @@ app.post('/bot2/api/friend-token', async (req, res) => {
 // Endpoint para obtener el estado del bot
 app.get('/bot2/api/bot-status', async (req, res) => {
     try {
-        // Verificar si el bot está autenticado
-        if (!botStatus.isAuthenticated) {
-            await loadDeviceAuth();
-        }
+        const status = {
+            isReady: true, // El bot está listo para recibir peticiones
+            isAuthenticated: botStatus.accessToken !== null,
+            displayName: botStatus.displayName || null,
+            lastError: null,
+            hasFriendToken: botStatus.deviceId !== null
+        };
         
-        res.json({
-            status: 'online',
-            authenticated: botStatus.isAuthenticated,
-            accountId: botStatus.accountId
-        });
+        res.json(status);
     } catch (error) {
         console.error('Error al obtener estado del bot:', error);
         res.status(500).json({ 
-            error: 'Error al obtener estado del bot',
-            details: error.message 
+            isReady: false,
+            isAuthenticated: false,
+            displayName: null,
+            lastError: error.message,
+            hasFriendToken: false
         });
     }
 });
